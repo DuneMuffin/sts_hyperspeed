@@ -64,7 +64,14 @@ namespace {
         CardInstance card(id, upgrades > 0);
         card.uniqueId = static_cast<std::int16_t>(uniqueId);
         if (src.contains("misc")) card.specialData = static_cast<std::int16_t>(py::cast<int>(src["misc"]));
-        if (src.contains("cost")) card.costForTurn = static_cast<std::int8_t>(py::cast<int>(src["cost"]));
+        if (src.contains("cost")) {
+            // The real game's JSON reports one cost per card. Use it for the combat cost too, so
+            // cards whose cost changed for the whole combat (Blood for Blood, Madness) keep it
+            // after the per-turn cost resets.
+            const int cost = py::cast<int>(src["cost"]);
+            card.costForTurn = static_cast<std::int8_t>(cost);
+            if (cost >= 0) card.cost = static_cast<std::int8_t>(cost);
+        }
         return card;
     }
 
@@ -1399,6 +1406,105 @@ PYBIND11_MODULE(slaythespire, m) {
             values["sundial"] = bc.player.sundialCounter;
             return values;
         })
+        .def("state_dict", [](const BattleContext &bc) {
+            // Complete, plain-data view of the combat state for differential
+            // testing against the real game. Ids are the simulator's enum ints.
+            namespace py = pybind11;
+            const auto cardList = [](const CardInstance *begin, int count) {
+                py::list out;
+                for (int i = 0; i < count; ++i) {
+                    const auto &c = begin[i];
+                    py::dict d;
+                    d["id"] = static_cast<int>(c.getId());
+                    d["name"] = std::string(c.getName());
+                    d["upgraded"] = c.isUpgraded();
+                    d["cost"] = static_cast<int>(c.cost);
+                    d["cost_for_turn"] = static_cast<int>(c.costForTurn);
+                    d["misc"] = static_cast<int>(c.specialData);
+                    d["unique_id"] = static_cast<int>(c.uniqueId);
+                    out.append(d);
+                }
+                return out;
+            };
+            py::dict out;
+            out["turn"] = bc.turn + 1;
+            out["outcome"] = static_cast<int>(bc.outcome);
+            out["input_state"] = static_cast<int>(bc.inputState);
+
+            py::dict player;
+            player["current_hp"] = bc.player.curHp;
+            player["max_hp"] = bc.player.maxHp;
+            player["block"] = bc.player.block;
+            player["energy"] = bc.player.energy;
+            player["energy_per_turn"] = static_cast<int>(bc.player.energyPerTurn);
+            player["cards_played_this_turn"] = static_cast<int>(bc.player.cardsPlayedThisTurn);
+            player["attacks_played_this_turn"] = static_cast<int>(bc.player.attacksPlayedThisTurn);
+            player["skills_played_this_turn"] = static_cast<int>(bc.player.skillsPlayedThisTurn);
+            player["cards_discarded_this_turn"] = static_cast<int>(bc.player.cardsDiscardedThisTurn);
+            player["times_damaged"] = static_cast<int>(bc.player.timesDamagedThisCombat);
+            player["bombs"] = py::make_tuple(bc.player.bomb1, bc.player.bomb2, bc.player.bomb3);
+            py::list playerPowers;
+            for (int i = 1; i < static_cast<int>(PlayerStatus::THE_BOMB); ++i) {
+                const auto s = static_cast<PlayerStatus>(i);
+                if (!bc.player.hasStatusRuntime(s)) continue;
+                py::dict p;
+                p["id"] = i;
+                p["name"] = std::string(playerStatusEnumStrings[i]);
+                // Boolean powers (e.g. Barricade) set only the status bit and have no stored amount.
+                int amount = 1;
+                try { amount = bc.player.getStatusRuntime(s); } catch (const std::out_of_range &) {}
+                p["amount"] = amount;
+                p["just_applied"] = i < 32 && (bc.player.justAppliedBits & (1U << i)) != 0;
+                playerPowers.append(p);
+            }
+            player["powers"] = playerPowers;
+            out["player"] = player;
+
+            py::list monsters;
+            for (int i = 0; i < bc.monsters.monsterCount; ++i) {
+                const auto &mo = bc.monsters.arr[i];
+                py::dict d;
+                d["slot"] = i;
+                d["id"] = static_cast<int>(mo.id);
+                d["name"] = std::string(mo.getName());
+                d["current_hp"] = mo.curHp;
+                d["max_hp"] = mo.maxHp;
+                d["block"] = mo.block;
+                d["half_dead"] = mo.halfDead;
+                d["is_gone"] = mo.isDeadOrEscaped();
+                d["move"] = static_cast<int>(mo.moveHistory[0]);
+                d["last_move"] = static_cast<int>(mo.moveHistory[1]);
+                d["move_name"] = std::string(monsterMoveStrings[static_cast<int>(mo.moveHistory[0])]);
+                d["misc_info"] = mo.miscInfo;
+                py::list powers;
+                for (int si = 0; si < static_cast<int>(MonsterStatus::INVALID); ++si) {
+                    const auto s = static_cast<MonsterStatus>(si);
+                    const bool has = s == MonsterStatus::STRENGTH ? mo.strength != 0 : mo.hasStatusInternal(s);
+                    if (!has) continue;
+                    py::dict p;
+                    p["id"] = si;
+                    p["name"] = std::string(monsterStatusEnumStrings[si]);
+                    p["amount"] = mo.getStatusInternal(s);
+                    powers.append(p);
+                }
+                d["powers"] = powers;
+                monsters.append(d);
+            }
+            out["monsters"] = monsters;
+
+            out["hand"] = cardList(bc.cards.hand.data(), bc.cards.cardsInHand);
+            out["draw_pile"] = cardList(bc.cards.drawPile.data(), static_cast<int>(bc.cards.drawPile.size()));
+            out["discard_pile"] = cardList(bc.cards.discardPile.data(), static_cast<int>(bc.cards.discardPile.size()));
+            out["exhaust_pile"] = cardList(bc.cards.exhaustPile.data(), static_cast<int>(bc.cards.exhaustPile.size()));
+
+            py::list potions;
+            for (int i = 0; i < bc.potionCapacity; ++i) potions.append(static_cast<int>(bc.potions[i]));
+            out["potions"] = potions;
+            py::list potionNames;
+            for (int i = 0; i < bc.potionCapacity; ++i) potionNames.append(std::string(potionEnumNames[static_cast<int>(bc.potions[i])]));
+            out["potion_names"] = potionNames;
+            return out;
+        }, "complete plain-dict view of the combat state (for differential testing against the real game)")
         .def("__repr__", [](const BattleContext &bc) {
             std::ostringstream os;
             os << bc;
