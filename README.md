@@ -1,5 +1,11 @@
 # sts_lightspeed
 
+## Checked against the real game
+
+`fidelity/` holds a replay test that compares this simulator, step by step, with recordings of real
+Slay the Spire combat, including exact RNG state. See [fidelity/README.md](fidelity/README.md).
+
+
 For tree search and simulation of the popular rogue-like deckbuilder game Slay The Spire
 
 **Features**
