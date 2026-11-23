@@ -16,6 +16,8 @@
 #include "sim/search/ScumSearchAgent2.h"
 #include "sim/search/GameAction.h"
 #include "sim/search/BattleScumSearcher2.h"
+#include "sim/search/FairBattleSearcher.h"
+#include "sim/search/CounterfactualRollout.h"
 #include "sim/search/ExpertKnowledge.h"
 #include "game/Shop.h"
 #include "sim/SimHelpers.h"
@@ -362,6 +364,7 @@ PYBIND11_MODULE(slaythespire, m) {
     agent.def(pybind11::init<>());
     agent.def_readwrite("simulation_count_base", &search::ScumSearchAgent2::simulationCountBase, "number of simulations the agent uses for monte carlo tree search each turn")
         .def_readwrite("boss_simulation_multiplier", &search::ScumSearchAgent2::bossSimulationMultiplier, "bonus multiplier to the simulation count for boss fights")
+        .def_readwrite("simulation_count_total", &search::ScumSearchAgent2::simulationCountTotal, "cumulative combat search simulations run by this agent")
         .def_readwrite("pause_on_card_reward", &search::ScumSearchAgent2::pauseOnCardReward, "causes the agent to pause so as to cede control to the user when it encounters a card reward choice")
         .def_readwrite("pause_on_map", &search::ScumSearchAgent2::pauseOnMap, "pause and cede control on the map (path choice) screen")
         .def_readwrite("pause_on_rest", &search::ScumSearchAgent2::pauseOnRest, "pause and cede control on the rest site (campfire) screen")
@@ -369,10 +372,23 @@ PYBIND11_MODULE(slaythespire, m) {
         .def_readwrite("pause_on_event", &search::ScumSearchAgent2::pauseOnEvent, "pause and cede control on event screens that have a real choice")
         .def_readwrite("pause_on_battle", &search::ScumSearchAgent2::pauseOnBattle, "pause at the start of each battle so the caller can drive combat with its own model")
         .def_readwrite("print_logs", &search::ScumSearchAgent2::printLogs, "when set to true, the agent prints state information as it makes actions")
-        .def("playout", &search::ScumSearchAgent2::playout);
+        .def("seed_rng", [](search::ScumSearchAgent2 &a, std::uint64_t s) {
+            a.rng.seed(static_cast<std::default_random_engine::result_type>(s));
+        }, "seed the agent's out-of-combat RNG")
+        .def("playout", &search::ScumSearchAgent2::playout)
+        .def("playout_battle", &search::ScumSearchAgent2::playoutBattle, "run the built-in battle searcher to completion on a BattleContext");
 
     pybind11::class_<GameContext> gameContext(m, "GameContext");
     gameContext.def(pybind11::init<CharacterClass, std::uint64_t, int>())
+        .def("clone", [](const GameContext &gc) {
+            GameContext copy(gc);
+            if (copy.map) {
+                copy.map = std::make_shared<Map>(*copy.map);
+            }
+            return copy;
+        }, "returns a deep copy of the GameContext")
+        .def("determinize", &search::determinizeGameContext, pybind11::arg("det_seed"),
+             "return a hidden-info-stripped determinized copy of this GameContext")
         .def("pick_reward_card", &sts::py::pickRewardCard, "choose to obtain the card at the specified index in the card reward list")
         .def("skip_reward_cards", &sts::py::skipRewardCards, "choose to skip the card reward (increases max_hp by 2 with singing bowl)")
         .def("get_card_reward", &sts::py::getCardReward, "return the current card reward list")
@@ -457,6 +473,16 @@ PYBIND11_MODULE(slaythespire, m) {
         .def_readwrite("cur_hp", &GameContext::curHp)
         .def_readwrite("max_hp", &GameContext::maxHp)
         .def_readwrite("gold", &GameContext::gold)
+        .def_readonly("potion_count", &GameContext::potionCount)
+        .def_readonly("potion_capacity", &GameContext::potionCapacity)
+        .def_property_readonly("potions", [](const GameContext &gc) {
+            std::vector<int> out;
+            out.reserve(gc.potionCapacity);
+            for (int i = 0; i < gc.potionCapacity; ++i) {
+                out.push_back(static_cast<int>(gc.potions[i]));
+            }
+            return out;
+        })
 
         .def_readwrite("blue_key", &GameContext::blueKey)
         .def_readwrite("green_key", &GameContext::greenKey)
@@ -502,6 +528,11 @@ PYBIND11_MODULE(slaythespire, m) {
         .def_readwrite("misc", &Card::misc, "value internal to the simulator used for things like ritual dagger damage");
 
     card.def_property_readonly("id", &Card::getId)
+        .def_property_readonly("name", [](const Card &c) { return std::string(c.getName()); })
+        .def_property_readonly("color", [](const Card &c) { return getCardColor(c.getId()); })
+        .def_property_readonly("cost", [](const Card &c) { return getEnergyCost(c.getId(), c.isUpgraded()); })
+        .def_property_readonly("base_damage", &Card::getBaseDamage)
+        .def_property_readonly("ethereal", [](const Card &c) { return isCardEthereal(c.getId(), c.isUpgraded()); })
         .def_property_readonly("upgraded", &Card::isUpgraded)
         .def_property_readonly("upgrade_count", &Card::getUpgraded)
         .def_property_readonly("innate", &Card::isInnate)
@@ -1345,6 +1376,8 @@ PYBIND11_MODULE(slaythespire, m) {
         })
         .def("clone", [](const BattleContext &bc) { return BattleContext(bc); },
              "returns a deep copy of the battle (value semantics, RNG included) for deterministic lookahead")
+        .def("determinize", &search::determinizeBattleContext, pybind11::arg("det_seed"),
+             "return a hidden-info-stripped determinized copy of this battle state")
         .def_static("from_snapshot", &battleFromSnapshot,
              "reconstruct a search state from a validated Steam combat snapshot and a determinization seed")
         .def("exit_battle", &BattleContext::exitBattle,
@@ -1529,6 +1562,48 @@ PYBIND11_MODULE(slaythespire, m) {
           },
           "run MCTS from the given battle state and return its recommended next action (BC teacher oracle)");
 
+    pybind11::enum_<search::FairAggregation>(m, "FairAggregation")
+        .value("VISITS", search::FairAggregation::VISITS)
+        .value("POOLED_MEAN", search::FairAggregation::POOLED_MEAN);
+
+    pybind11::class_<search::FairSearchConfig>(m, "FairSearchConfig")
+        .def(pybind11::init<>())
+        .def_readwrite("total_sims", &search::FairSearchConfig::totalSims)
+        .def_readwrite("num_determinizations", &search::FairSearchConfig::numDeterminizations)
+        .def_readwrite("boss_sim_multiplier", &search::FairSearchConfig::bossSimMultiplier)
+        .def_readwrite("fair", &search::FairSearchConfig::fair)
+        .def_readwrite("aggregation", &search::FairSearchConfig::aggregation)
+        .def_readwrite("search_seed", &search::FairSearchConfig::searchSeed);
+
+    pybind11::class_<search::FairActionStat>(m, "FairActionStat")
+        .def_readonly("action", &search::FairActionStat::action)
+        .def_readonly("total_visits", &search::FairActionStat::totalVisits)
+        .def_readonly("eval_sum", &search::FairActionStat::evalSum)
+        .def_property_readonly("mean_eval", &search::FairActionStat::meanEval);
+
+    pybind11::class_<search::FairPlayoutResult>(m, "FairPlayoutResult")
+        .def_readonly("sims_total", &search::FairPlayoutResult::simsTotal)
+        .def_readonly("decisions", &search::FairPlayoutResult::decisions)
+        .def_readonly("nontrivial_decisions", &search::FairPlayoutResult::nontrivialDecisions)
+        .def_readonly("timed_out", &search::FairPlayoutResult::timedOut);
+
+    m.def("fair_search_stats",
+          [](const BattleContext &bc, const search::FairSearchConfig &cfg) {
+              return search::fairSearchDecision(bc, cfg, cfg.searchSeed).actionStats;
+          },
+          pybind11::arg("bc"), pybind11::arg("cfg"),
+          "run determinized (or 1-step oracle) MCTS and return sorted root action statistics");
+
+    m.def("fair_search_recommend",
+          &search::fairSearchRecommend,
+          pybind11::arg("bc"), pybind11::arg("cfg"),
+          "return the top action recommended by fairSearchDecision");
+
+    m.def("playout_battle_fair",
+          &search::playoutBattleFair,
+          pybind11::arg("bc"), pybind11::arg("cfg"), pybind11::arg("max_decisions") = 2000,
+          "play a BattleContext to completion using step-by-step fair or 1-step oracle search");
+
     // ******************** OUT-OF-COMBAT GAME ACTION API ********************
     // generic interface to drive map / rest / shop / event / rewards decisions from python,
     // mirroring the in-combat forward-search api (get_legal_game_actions + GameAction.execute)
@@ -1563,6 +1638,34 @@ PYBIND11_MODULE(slaythespire, m) {
     m.def("get_legal_game_actions",
           [](const GameContext &gc) { return search::GameAction::getAllActionsInState(gc); },
           "enumerate all legal out-of-combat game actions in the current screen state");
+
+    pybind11::class_<search::RolloutConfig>(m, "RolloutConfig")
+        .def(pybind11::init<>())
+        .def_readwrite("num_rollouts", &search::RolloutConfig::numRollouts)
+        .def_readwrite("rollout_sims", &search::RolloutConfig::rolloutSims)
+        .def_readwrite("boss_sim_multiplier", &search::RolloutConfig::bossSimMultiplier)
+        .def_readwrite("max_act", &search::RolloutConfig::maxAct)
+        .def_readwrite("search_seed", &search::RolloutConfig::searchSeed);
+
+    pybind11::class_<search::RolloutActionStat>(m, "RolloutActionStat")
+        .def_readonly("action", &search::RolloutActionStat::action)
+        .def_readonly("rollouts", &search::RolloutActionStat::rollouts)
+        .def_readonly("wins", &search::RolloutActionStat::wins)
+        .def_readonly("score_sum", &search::RolloutActionStat::scoreSum)
+        .def_readonly("floor_sum", &search::RolloutActionStat::floorSum)
+        .def_readonly("win_hp_sum", &search::RolloutActionStat::winHpSum)
+        .def_property_readonly("win_rate", &search::RolloutActionStat::winRate)
+        .def_property_readonly("mean_score", &search::RolloutActionStat::meanScore);
+
+    m.def("get_macro_decision_actions",
+          &search::getMacroDecisionActions,
+          pybind11::arg("gc"),
+          "enumerate clean candidate macro actions on the current non-combat screen");
+
+    m.def("rollout_eval_game_actions",
+          &search::evaluateGameActionsByRollout,
+          pybind11::arg("gc"), pybind11::arg("actions"), pybind11::arg("cfg"),
+          "evaluate candidate macro actions via CRN counterfactual rollouts");
 
 #ifdef VERSION_INFO
     m.attr("__version__") = MACRO_STRINGIFY(VERSION_INFO);

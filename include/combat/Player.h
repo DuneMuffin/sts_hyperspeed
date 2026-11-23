@@ -31,7 +31,7 @@ namespace sts {
     class BattleContext;
 
     struct Player {
-        CharacterClass cc;
+        CharacterClass cc = CharacterClass::IRONCLAD;
 
         int16_t gold = 0;
         int curHp = 80;

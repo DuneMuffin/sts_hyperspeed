@@ -158,9 +158,10 @@ void Shop::buyCardRemove(GameContext &gc) {
     removeCost = -1;
     ++gc.shopRemoveCount;
 
-    gc.regainControlAction = [=](GameContext &g) {
+    auto prevRegainControl = gc.regainControlAction;
+    gc.regainControlAction = [prevRegainControl](GameContext &g) {
         g.screenState = ScreenState::SHOP_ROOM;
-        g.regainControlAction = gc.regainControlAction;
+        g.regainControlAction = prevRegainControl;
     };
 
     gc.openCardSelectScreen(CardSelectScreenType::REMOVE, 1);
